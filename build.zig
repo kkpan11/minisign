@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 
 pub fn build(b: *std.Build) !void {
@@ -13,34 +14,73 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .strip = true,
     });
+
+    // fix Mach-O relocation
+    minisign.headerpad_max_install_names = true;
+
     minisign.linkLibC();
     if (use_libzodium) {
-        const libzodium_mod = b.createModule(.{
-            .root_source_file = b.path("src/libzodium/libzodium.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const libzodium = b.addStaticLibrary(.{
-            .name = "zodium",
-            .root_module = libzodium_mod,
-            .strip = true,
-        });
+        var libzodium = lib: {
+            if (builtin.zig_version.major == 0 and builtin.zig_version.minor < 13) {
+                @compileError("Building requires Zig 0.13.0 or later");
+            }
+            if (builtin.zig_version.major == 0 and builtin.zig_version.minor == 13) {
+                break :lib b.addStaticLibrary(.{
+                    .name = "zodium",
+                    .strip = true,
+                    .root_source_file = b.path("src/libzodium/libzodium.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                });
+            } else {
+                const libzodium_mod = b.createModule(.{
+                    .root_source_file = b.path("src/libzodium/libzodium.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                });
+                break :lib b.addStaticLibrary(.{
+                    .name = "zodium",
+                    .root_module = libzodium_mod,
+                    .strip = true,
+                });
+            }
+        };
         libzodium.linkLibC();
         b.installArtifact(libzodium);
         minisign.root_module.addCMacro("LIBZODIUM", "1");
         minisign.linkLibrary(libzodium);
     } else {
+        var override_pkgconfig = false;
+        if (std.posix.getenv("LIBSODIUM_INCLUDE_PATH")) |path| {
+            minisign.addSystemIncludePath(.{ .cwd_relative = path });
+            override_pkgconfig = true;
+        }
+        if (std.posix.getenv("LIBSODIUM_LIB_PATH")) |path| {
+            minisign.addLibraryPath(.{ .cwd_relative = path });
+            override_pkgconfig = true;
+        }
+
+        for ([_][]const u8{ "/opt/homebrew/include", "/home/linuxbrew/.linuxbrew/include", "/usr/local/include" }) |path| {
+            std.fs.accessAbsolute(path, .{}) catch continue;
+            minisign.addSystemIncludePath(.{ .cwd_relative = path });
+        }
+        for ([_][]const u8{ "/opt/homebrew/lib", "/home/linuxbrew/.linuxbrew/lib", "/usr/local/lib" }) |path| {
+            std.fs.accessAbsolute(path, .{}) catch continue;
+            minisign.addLibraryPath(.{ .cwd_relative = path });
+        }
+        if (!use_static_linking) {
+            minisign.headerpad_max_install_names = true; // required to compile using Homebrew, see https://github.com/jedisct1/minisign/pull/155
+        }
         minisign.root_module.linkSystemLibrary(
             "sodium",
             .{
-                .use_pkg_config = .yes,
+                .use_pkg_config = if (override_pkgconfig) .no else .yes,
                 .preferred_link_mode = if (use_static_linking) .static else .dynamic,
             },
         );
     }
     minisign.addIncludePath(b.path("src"));
-    minisign.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    minisign.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
+
     minisign.root_module.addCMacro("_GNU_SOURCE", "1");
     const source_files = &.{ "src/base64.c", "src/get_line.c", "src/helpers.c", "src/minisign.c" };
     minisign.addCSourceFiles(.{ .files = source_files });
